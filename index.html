@@ -124,7 +124,7 @@
     <div class="panel">
       <div class="eyebrow" id="overlayEyebrow">2D 追逃</div>
       <h1 id="overlayTitle">追 · 逃</h1>
-      <p id="overlayDesc">WASD 控制求生者，在废弃园区中躲避监管者。监管者会实时寻路追捕，并每 10 秒召唤一个持续 4 秒的传送圈：圈内角色一旦越界，就会被传回圈内另一侧。</p>
+      <p id="overlayDesc">WASD 控制求生者，在废弃园区中躲避监管者。监管者会实时寻路追捕，并每 10 秒布下一个持续 4 秒的传送圈：它会借圈边传送突进到你附近；圈内角色一旦越界，也会被传回圈内另一侧。</p>
       <p class="goal" id="overlayGoal">存活 60 秒即可逃脱</p>
       <button id="overlayBtn">开始游戏</button>
       <div class="keys"><span>W</span><span>A</span><span>S</span><span>D</span> 八向移动 · <span>R</span> 重新开始</div>
@@ -149,6 +149,10 @@
   const CIRCLE_LIFETIME = 4;           // 传送圈存活时间（秒）
   const CIRCLE_SIZES_M = [9, 12, 15];  // 传送圈直径（米），AI 每次随机选一种
   const DEBUG_SKILL = false;           // 技能调试日志（验证时开启）
+  const STRIKE_NEAR_MARGIN = 8;        // 突进圈：监管者贴内圈边缘的预留距离（像素）
+  const STRIKE_TIMEOUT = 0.35;         // 突进圈：后撤越界时限（秒）
+  const STRIKE_MIN_GAP = 6 * PPM;      // 突进落点与求生者的最小中心距（留出反应空间）
+  const STRIKE_TARGET_GAP = 7 * PPM;   // 突进落点与求生者的理想中心距
   const CELL = 40;                     // 寻路网格尺寸（1 米）
   const COLS = MAP_W / CELL;           // 70
   const ROWS = MAP_H / CELL;           // 50
@@ -221,7 +225,8 @@
   const player = { x: 0, y: 0, w: PLAYER_SIZE, h: PLAYER_SIZE, faceX: 0, faceY: 1 };
   const hunter = {
     x: 0, y: 0, w: HUNTER_SIZE, h: HUNTER_SIZE,
-    path: [], repathTimer: 0, lastGoalCell: -1
+    path: [], repathTimer: 0, lastGoalCell: -1,
+    strike: null             // { dx, dy, timer }：布圈后主动后撤越界
   };
 
   let state = 'ready';   // ready | playing | caught | won
@@ -563,29 +568,100 @@
     return best || { x: ent.x, y: ent.y };
   }
 
+  // AI 布圈决策：圈心放在监管者与求生者连线之间，监管者贴内圈近端边缘。
+  // 监管者随后主动后撤越界，传送落点在圈的远端、靠近求生者的一侧。
+  function planStrikeCircle() {
+    const hx = hunter.x + hunter.w / 2;
+    const hy = hunter.y + hunter.h / 2;
+    const px = player.x + player.w / 2;
+    const py = player.y + player.h / 2;
+    const dx = px - hx, dy = py - hy;
+    const d = Math.hypot(dx, dy);
+    if (d < 1) return null;
+
+    const ux = dx / d, uy = dy / d;               // 监管者 → 求生者
+    const bodyR = Math.hypot(hunter.w, hunter.h) / 2;
+    const nearInset = bodyR + STRIKE_NEAR_MARGIN; // 圈心到监管者中心
+    let best = null, bestScore = Infinity;
+
+    for (let i = 0; i < CIRCLE_SIZES_M.length; i++) {
+      const sizeM = CIRCLE_SIZES_M[i];
+      const r = (sizeM * PPM) / 2;
+
+      // 圆心沿连线前移，使监管者刚好贴住近端内边缘
+      const cx = hx + ux * (r - nearInset);
+      const cy = hy + uy * (r - nearInset);
+      if (cx < WALL + r || cy < WALL + r || cx > MAP_W - WALL - r || cy > MAP_H - WALL - r) continue;
+
+      const probe = { cx: cx, cy: cy, r: r };
+      if (!isBodyInsideCircle(hunter, probe)) continue;
+
+      // 后撤方向要有空间，否则无法触界
+      const back = STRIKE_NEAR_MARGIN + 12;
+      const bx = hx - ux * back;
+      const by = hy - uy * back;
+      if (!isFreeRect(bx - hunter.w / 2, by - hunter.h / 2, hunter.w, hunter.h)) continue;
+
+      // 预判传送落点：圈内远端、朝向求生者
+      const landInset = r - nearInset;
+      const lx = cx + ux * landInset;
+      const ly = cy + uy * landInset;
+      const left = lx - hunter.w / 2;
+      const top = ly - hunter.h / 2;
+      if (!isFreeRect(left, top, hunter.w, hunter.h)) continue;
+      if (!isRectInsideCircle(left, top, hunter.w, hunter.h, probe)) continue;
+
+      const landDist = Math.hypot(px - lx, py - ly);
+      if (landDist < STRIKE_MIN_GAP) continue;   // 会直接贴脸
+      if (landDist > d - 60) continue;           // 拉不开距离，没有收益
+
+      // 落点越接近理想间距越好；同等条件下优先小圈，避免过度位移
+      const score = Math.abs(landDist - STRIKE_TARGET_GAP) + sizeM * 0.6;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { cx: cx, cy: cy, r: r, sizeM: sizeM, ux: ux, uy: uy, landDist: landDist };
+      }
+    }
+
+    return best;
+  }
+
   function spawnTeleportCircle() {
-    const sizeM = CIRCLE_SIZES_M[Math.floor(Math.random() * CIRCLE_SIZES_M.length)];
-    const r = (sizeM * PPM) / 2;  // 9 / 12 / 15 米直径
+    const plan = planStrikeCircle();
 
-    // 以求生者为目标生成，并保证整个圈落在地图内
-    const pcx = player.x + player.w / 2;
-    const pcy = player.y + player.h / 2;
-    const cx = clamp(pcx, r + WALL, MAP_W - WALL - r);
-    const cy = clamp(pcy, r + WALL, MAP_H - WALL - r);
+    if (plan) {
+      // 突进圈：AI 自选圆心与尺寸，监管者就位于内圈近端
+      circle = {
+        cx: plan.cx, cy: plan.cy, r: plan.r, sizeM: plan.sizeM,
+        age: 0, life: CIRCLE_LIFETIME, mode: 'strike',
+        playerInside: false, hunterInside: false, hunterDone: false
+      };
+      hunter.strike = { dx: -plan.ux, dy: -plan.uy, timer: STRIKE_TIMEOUT };
+    } else {
+      // 陷阱圈：无法突进时贴求生者生成，限制其走位
+      const sizeM = CIRCLE_SIZES_M[Math.floor(Math.random() * CIRCLE_SIZES_M.length)];
+      const r = (sizeM * PPM) / 2;
+      const pcx = player.x + player.w / 2;
+      const pcy = player.y + player.h / 2;
+      const cx = clamp(pcx, r + WALL, MAP_W - WALL - r);
+      const cy = clamp(pcy, r + WALL, MAP_H - WALL - r);
+      circle = {
+        cx: cx, cy: cy, r: r, sizeM: sizeM,
+        age: 0, life: CIRCLE_LIFETIME, mode: 'trap',
+        playerInside: false, hunterInside: false, hunterDone: false
+      };
+    }
 
-    circle = {
-      cx: cx, cy: cy, r: r, sizeM: sizeM,
-      age: 0, life: CIRCLE_LIFETIME,
-      playerInside: false, hunterInside: false
-    };
     circle.playerInside = isBodyInsideCircle(player, circle);
     circle.hunterInside = isBodyInsideCircle(hunter, circle);
 
-    effects.push({ type: 'ring', x: cx, y: cy, r0: r * 0.55, r1: r * 1.04, t: 0, dur: 0.45, rgb: '255, 150, 200' });
+    effects.push({ type: 'ring', x: circle.cx, y: circle.cy, r0: circle.r * 0.55, r1: circle.r * 1.04, t: 0, dur: 0.45, rgb: '255, 150, 200' });
 
     if (DEBUG_SKILL) {
-      console.log('[skill] spawn size=' + sizeM + 'm r=' + r.toFixed(1) +
-        ' center=(' + cx.toFixed(1) + ',' + cy.toFixed(1) + ')' +
+      console.log('[skill] spawn mode=' + circle.mode +
+        ' size=' + circle.sizeM + 'm r=' + circle.r.toFixed(1) +
+        ' center=(' + circle.cx.toFixed(1) + ',' + circle.cy.toFixed(1) + ')' +
+        (plan ? ' landDist=' + plan.landDist.toFixed(1) : '') +
         ' t=' + survival.toFixed(2) + 's');
     }
   }
@@ -604,8 +680,10 @@
     ent.x = dest.x;
     ent.y = dest.y;
 
-    // 监管者被传送后立即重新寻路
+    // 监管者被传送后立即重新寻路；本圈不再对其触发，避免来回弹跳
     if (!isPlayer) {
+      hunter.strike = null;
+      circle.hunterDone = true;
       hunter.path = [];
       hunter.repathTimer = 0;
       hunter.lastGoalCell = -1;
@@ -639,6 +717,7 @@
 
     for (let i = 0; i < checks.length; i++) {
       const item = checks[i];
+      if (!item.isPlayer && circle.hunterDone) continue;   // 监管者每圈只突进一次
       const p = farthestBodyPoint(item.ent, circle.cx, circle.cy);
       const dist = Math.hypot(p.x - circle.cx, p.y - circle.cy);
 
@@ -661,6 +740,7 @@
       if (circle.life <= 0) {
         effects.push({ type: 'ring', x: circle.cx, y: circle.cy, r0: circle.r, r1: circle.r * 1.12, t: 0, dur: 0.4, rgb: '255, 110, 160' });
         if (DEBUG_SKILL) console.log('[skill] expire t=' + survival.toFixed(2) + 's');
+        hunter.strike = null;
         circle = null;
       }
     }
@@ -682,6 +762,7 @@
   function resetSkillState() {
     skillTimer = SKILL_INTERVAL;
     circle = null;
+    hunter.strike = null;
     screenFlash = 0;
     lastSkillText = '';
     effects.length = 0;
@@ -809,6 +890,18 @@
   }
 
   function updateHunter(dt) {
+    // 突进阶段：主动后撤让身体触界，以此触发自身传送
+    if (hunter.strike) {
+      hunter.strike.timer -= dt;
+      if (hunter.strike.timer <= 0) {
+        hunter.strike = null;
+        if (DEBUG_SKILL) console.log('[skill] strike abort t=' + survival.toFixed(2) + 's');
+      } else {
+        moveEntity(hunter, hunter.strike.dx * HUNTER_SPEED * dt, hunter.strike.dy * HUNTER_SPEED * dt);
+        return;
+      }
+    }
+
     const px = player.x + player.w / 2;
     const py = player.y + player.h / 2;
     const pCell = cellIndexOf(px, py);
